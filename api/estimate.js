@@ -50,11 +50,11 @@ export default async function handler(req, res) {
 
     // ====== ⑤ JSONレスポンス ======
     return res.status(200).json({
-      region,
-      population,
-      estimatedCoolGuys,
-      note: "人口データはWikidataから自動取得しています"
-    });
+  region,
+  population: { value: population }, // ← ★ここをオブジェクトに
+  estimatedCoolGuys,
+  note: "人口データはWikidataから自動取得しています"
+});
   } catch (error) {
     console.error("Error fetching population:", error);
     return res.status(500).json({ error: "Failed to fetch population data" });
