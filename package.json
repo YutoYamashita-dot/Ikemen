@@ -1,9 +1,11 @@
 {
-  "name": "coolguys-api",
+  "name": "ikemen-backend",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
-  "scripts": {
-    "dev": "vercel dev"
-  },
-  "dependencies": {}
+  "license": "MIT",
+  "devDependencies": {
+    "@vercel/node": "latest",
+    "typescript": "^5.6.3"
+  }
 }
