@@ -1,11 +1,8 @@
 {
-  "name": "ikemen-backend",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
-  "license": "MIT",
-  "devDependencies": {
-    "@vercel/node": "latest",
-    "typescript": "^5.6.3"
-  }
+  "dependencies": {
+    "@vercel/node": "3",
+    "@vercel/blob": "0.23.3",
+    "node-fetch": "3.3.2"
+  },
+  "type": "module"
 }
