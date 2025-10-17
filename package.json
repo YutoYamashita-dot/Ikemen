@@ -1,0 +1,9 @@
+{
+  "name": "coolguys-api",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "dependencies": {}
+}
