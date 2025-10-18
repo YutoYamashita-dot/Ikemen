@@ -2,12 +2,12 @@ import express from "express";
 import cors from "cors";
 
 /**
- * この版のポイント
- * - 地域名の曖昧さを解消：都道府県ヒント抽出、厳密一致→別名一致→部分一致の段階評価
- * - Wikidata: 男性人口(P1540)/女性(P1539)/総人口(P1082)の最新値（P585）優先で取得
- * - 面積(P2046)も取得。単位は wdt: を使うため km² に正規化済みの数値が返ってくる想定
- * - スコアリングで最も妥当な候補を選択（ラベル完全一致 > altLabel一致 > 都道府県一致 > 人口規模/新しさ）
- * - キャッシュ/タイムアウト/リトライで 503/無応答に耐性
+ * 修正ポイント
+ * 1) SPARQL に PREFIX を追加（必須）
+ * 2) 面積(P2046)は p:/psn:/wikibase:quantityAmount & quantityUnit を使い、km²に正規化
+ * 3) 都道府県ヒント、厳密一致→別名一致→部分一致の段階評価は維持
+ * 4) 男性人口：P1540 > (P1082 - P1539) > 0.50*P1082
+ * 5) タイムアウト/リトライ/キャッシュを維持
  */
 
 const app = express();
@@ -57,17 +57,11 @@ function expandNames(raw) {
   const norm = normalize(raw);
   const pref = extractPrefHint(norm);
   const withoutPref = pref ? norm.replace(pref, "") : norm;
-
-  // 末尾の区市町村を外した base
   const base = withoutPref.replace(/(特別区|[区市町村])$/u, "");
-
   const list = [
     norm, withoutPref,
     base, base + "区", base + "市", base + "町", base + "村",
-    // よくある記法
-    base + "区役所", base + "市役所" // 予防線（ヒットしたら後でスコア低めに）
   ].filter(Boolean);
-
   return Array.from(new Set(list));
 }
 
@@ -79,15 +73,13 @@ const toNum = (v) => {
   const n = Number(s);
   return Number.isFinite(n) ? n : null;
 };
-
 const toTime = (v) => {
   if (!v) return 0;
   const t = Date.parse(v);
   return Number.isFinite(t) ? t : 0;
 };
 
-/* --------------------- 年齢レンジ按分 --------------------- */
-// 日本の年齢構成（概算3区分：総務省ベースの丸め値）
+/* --------------------- 年齢レンジ按分（概算） --------------------- */
 function jpAgeShare(minAge, maxAge) {
   const bands = [
     [0, 14, 0.127],
@@ -117,13 +109,27 @@ function stdNormCdf(x) {
 const upperTailFromHensachi = (h) => 1 - stdNormCdf((h - 50) / 10);
 
 /* ------------------- Wikidata クエリ実行 ------------------- */
-async function queryWikidata(sparql, { timeoutMs = 4000, retries = 2 } = {}) {
+const PREFIX = `
+PREFIX wd: <http://www.wikidata.org/entity/>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX p: <http://www.wikidata.org/prop/>
+PREFIX ps: <http://www.wikidata.org/prop/statement/>
+PREFIX psn: <http://www.wikidata.org/prop/statement/value-normalized/>
+PREFIX pq: <http://www.wikidata.org/prop/qualifier/>
+PREFIX pqn: <http://www.wikidata.org/prop/qualifier/value-normalized/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX wikibase: <http://wikiba.se/ontology#>
+PREFIX uom: <http://qudt.org/vocab/unit/>
+`;
+
+async function queryWikidata(sparql, { timeoutMs = 5000, retries = 2 } = {}) {
   let lastErr = null;
   for (let i = 0; i <= retries; i++) {
     const ctrl = new AbortController();
     const id = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const url = "https://query.wikidata.org/sparql?format=json&query=" + encodeURIComponent(sparql);
+      const url = "https://query.wikidata.org/sparql?format=json&query=" + encodeURIComponent(PREFIX + sparql);
       const resp = await fetch(url, {
         headers: {
           "User-Agent": "CoolGuysBackend/1.2 (contact: example@example.com)",
@@ -144,58 +150,73 @@ async function queryWikidata(sparql, { timeoutMs = 4000, retries = 2 } = {}) {
   return null;
 }
 
-/* -------- 候補取得: 男性/女性/総人口(最新)・面積・都道府県 -------- */
+/* -------- 候補取得: 男性/女性/総人口(最新)・面積(km²)・都道府県 -------- */
 async function fetchCandidates(rawRegion) {
   const prefHint = extractPrefHint(rawRegion);
   const names = expandNames(rawRegion);
-  // 検索パターン（OR）
   const pat = names.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
 
-  // 行政区分に限定（市/特別区/一般区/町/村/政令指定都市の区など）
+  // 市/特別区/一般区/町/村 など（日本の基礎自治体を広めに）
   const classes = [
     "wd:Q515",      // city
     "wd:Q532",      // special ward of Tokyo
     "wd:Q30335059", // ward of Japan
     "wd:Q1012369",  // town of Japan
     "wd:Q5322507",  // village of Japan
-    "wd:Q70208",    // urban municipality of Japan (旧)
+    "wd:Q70208",    // urban municipality of Japan（互換）
     "wd:Q15284"     // municipality
   ].join(" ");
 
+  // 面積は p:/psn:/quantityAmount, quantityUnit で取り、km²へ正規化
   const sparql = `
-SELECT ?item ?itemLabel ?prefLabel ?male ?female ?total ?area ?maleTime ?femaleTime ?popTime WHERE {
+SELECT ?item ?itemLabel ?prefLabel
+       ?male ?female ?total ?maleTime ?femaleTime ?popTime
+       ?areaAmount ?areaUnit
+WHERE {
   VALUES ?class { ${classes} }
   ?item wdt:P17 wd:Q17 .
   ?item wdt:P31 ?class .
-  OPTIONAL { ?item wdt:P131 ?pref . ?pref rdfs:label ?prefLabel . FILTER(LANG(?prefLabel)="ja") }
 
-  # 男性人口（最新）
+  # 都道府県（上位行政区で日本の都道府県相当）
+  OPTIONAL {
+    ?item wdt:P131 ?pref .
+    ?pref rdfs:label ?prefLabel .
+    FILTER(LANG(?prefLabel)="ja")
+  }
+
+  # 男性人口（最新候補）
   OPTIONAL {
     ?item p:P1540 ?mStmt .
     ?mStmt ps:P1540 ?male .
     OPTIONAL { ?mStmt pq:P585 ?maleTime }
   }
-  # 女性人口（最新）
+  # 女性人口（最新候補）
   OPTIONAL {
     ?item p:P1539 ?fStmt .
     ?fStmt ps:P1539 ?female .
     OPTIONAL { ?fStmt pq:P585 ?femaleTime }
   }
-  # 総人口（最新）
+  # 総人口（最新候補）
   OPTIONAL {
     ?item p:P1082 ?tStmt .
     ?tStmt ps:P1082 ?total .
     OPTIONAL { ?tStmt pq:P585 ?popTime }
   }
-  # 面積（km²：wdt は正規化済み値が返ってくる想定）
-  OPTIONAL { ?item wdt:P2046 ?area }
+
+  # 面積：数量と単位を取得（例：平方メートル、平方キロなど）
+  OPTIONAL {
+    ?item p:P2046 ?aStmt .
+    ?aStmt psn:P2046 ?areaNode .
+    ?areaNode wikibase:quantityAmount ?areaAmount ;
+              wikibase:quantityUnit ?areaUnit .
+  }
 
   # ラベル・別名
   ?item rdfs:label ?itemLabel .
   FILTER (LANG(?itemLabel) = "ja" || LANG(?itemLabel) = "en")
   OPTIONAL { ?item skos:altLabel ?alt . FILTER (LANG(?alt) = "ja") }
 
-  # マッチ条件：完全一致優先→別名一致→部分一致
+  # マッチ条件：完全一致→別名一致→部分一致
   FILTER (
     regex(str(?itemLabel), "^(${pat})$", "i") ||
     regex(str(?alt), "^(${pat})$", "i") ||
@@ -203,44 +224,53 @@ SELECT ?item ?itemLabel ?prefLabel ?male ?female ?total ?area ?maleTime ?femaleT
   )
 }
 ORDER BY DESC(?popTime) DESC(?maleTime) DESC(?total)
-LIMIT 20
+LIMIT 25
   `;
 
   const rows = await queryWikidata(sparql);
   if (!rows) return [];
 
-  // スコアリング：完全一致 + 都道府県一致 + 人口規模 + 最新性
   const norm = normalize(rawRegion);
   const suff = /[区市町村]$/u.test(norm) ? norm.slice(-1) : "";
-
   const scored = rows.map((r) => {
     const label = r?.itemLabel?.value ?? "";
     const pref = r?.prefLabel?.value ?? "";
     const male = toNum(r?.male?.value);
     const female = toNum(r?.female?.value);
     const total = toNum(r?.total?.value);
-    const area = toNum(r?.area?.value);
     const maleTime = toTime(r?.maleTime?.value);
     const popTime = toTime(r?.popTime?.value);
 
+    // 面積 km² へ正規化（代表的な単位のみ対応：平方メートル/平方キロ）
+    let areaKm2 = null;
+    const amount = toNum(r?.areaAmount?.value);
+    const unitIri = r?.areaUnit?.value || "";
+    if (amount != null) {
+      // よくある単位
+      // QUDT の URI は様々： http://qudt.org/vocab/unit/KiloM2 など
+      // 代表的に "KiloM2" を km², "SquareMeter" を m² として扱う
+      if (/KiloM2/i.test(unitIri)) {
+        areaKm2 = amount; // すでに km²
+      } else if (/SquareMeter/i.test(unitIri) || /M2$/i.test(unitIri)) {
+        areaKm2 = amount / 1e6; // m² → km²
+      } else {
+        // わからなければ素直に値を採用（多くは km²）
+        areaKm2 = amount;
+      }
+    }
+
+    // スコアリング
     let s = 0;
     const labelNorm = normalize(label);
-
-    // 完全一致（日本語ラベル）
-    if (labelNorm === norm) s += 1000;
-
-    // 末尾の区市町村が合う
-    if (suff && labelNorm.endsWith(suff)) s += 50;
-
-    // 都道府県ヒント一致
-    if (prefHint && pref && pref.includes(prefHint)) s += 300;
-
-    // 人口規模（総人口 or 男性人口）
+    if (labelNorm === norm) s += 1000;               // 完全一致
+    if (suff && labelNorm.endsWith(suff)) s += 50;   // 末尾の区市町村が合う
+    const prefHint = extractPrefHint(rawRegion);
+    if (prefHint && pref && pref.includes(prefHint)) s += 300; // 都道府県ヒント一致
     const mag = (total ?? male ?? 0);
-    s += Math.log10(Math.max(1, mag + 1)) * 10;
-
-    // データの新しさ
-    s += (popTime || maleTime) ? Math.min(50, ((Math.max(popTime, maleTime) - 1262304000000) / (365*24*3600*1000))) : 0; // 2010年基準
+    s += Math.log10(Math.max(1, mag + 1)) * 10;      // 人口規模
+    s += (popTime || maleTime)                      // 新しさ
+      ? Math.min(50, ((Math.max(popTime, maleTime) - 1262304000000) / (365*24*3600*1000)))
+      : 0;
 
     return {
       score: s,
@@ -249,13 +279,12 @@ LIMIT 20
       male,
       female,
       total,
-      areaKm2: area,
+      areaKm2,
       maleTime,
       popTime
     };
   });
 
-  // スコア最高を採用
   scored.sort((a, b) => b.score - a.score);
   return scored;
 }
@@ -270,13 +299,12 @@ app.get("/estimate", async (req, res) => {
     const maxAge = Math.max(0, Math.min(99, parseInt(req.query.maxAge ?? "35", 10)));
     const hensachi = req.query.hensachi != null ? Number(req.query.hensachi) : null;
 
-    const key = `est2:${region}|${minAge}-${maxAge}`;
+    const key = `est3:${region}|${minAge}-${maxAge}|${hensachi ?? "na"}`;
     const cached = getCache(key);
     if (cached) return res.json(cached);
 
     const cand = await fetchCandidates(region);
     if (cand.length === 0) {
-      // 形は保って返す（フロントでフォールバック可能）
       const payload = {
         region,
         maleInRange: 0,
@@ -289,6 +317,7 @@ app.get("/estimate", async (req, res) => {
     }
 
     const top = cand[0];
+
     // 男性人口の優先順位：male -> total-female -> total*0.50
     let male = top.male ?? ((top.total != null && top.female != null) ? (top.total - top.female) : null);
     if (male == null && top.total != null) male = Math.round(top.total * 0.50);
@@ -296,7 +325,7 @@ app.get("/estimate", async (req, res) => {
 
     const share = jpAgeShare(minAge, maxAge);
     let maleInRange = Math.round(male * share);
-    if (male > 0 && maleInRange <= 0) maleInRange = 1; // 0 固定回避
+    if (male > 0 && maleInRange <= 0) maleInRange = 1; // 0 固定を回避
 
     const payload = {
       region: top.label,
@@ -329,13 +358,12 @@ app.get("/regions", async (req, res) => {
     const q = (req.query.q ?? "").toString().trim();
     if (!q) return res.json({ candidates: [] });
 
-    const key = `regions2:${q}`;
+    const key = `regions3:${q}`;
     const cached = getCache(key);
     if (cached) return res.json(cached);
 
     const cands = await fetchCandidates(q);
 
-    // 表示は「ラベル（都道府県）」を優先（Android の UI は単純文字列でもOK）
     const seen = new Set();
     const list = [];
     for (const r of cands) {
