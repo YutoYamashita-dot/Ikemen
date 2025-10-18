@@ -1,65 +1,52 @@
 // /api/region/candidates.js
-export default async function handler(req, res) {
-  // CORS（アプリから直接叩けるように許可）
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.status(200).end();
+// 文字列を含む日本の自治体（市/区/町/村など）候補を Wikidata から取得
+// 返却: { candidates: [{ regionName, qid }] }
 
-  if (req.method !== "GET") {
-    return res.status(405).json({ error: "Method Not Allowed" });
-  }
+const { fetchWithRetry } = require('./_lib/fetchWithRetry');
 
-  const kw = (req.query.kw || "").toString().trim();
-  if (!kw) {
-    return res.status(200).json({ candidates: [] });
-  }
+module.exports = async (req, res) => {
+  res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=300'); // 5分キャッシュ
+  if (req.method !== 'GET') return res.status(405).json({ error: 'Method Not Allowed' });
 
-  // 日本の都道府県/市区町村など（行政区画）を対象に、日本語ラベルでヒット
+  const kw = (req.query.kw || '').toString().trim();
+  if (!kw) return res.status(200).json({ candidates: [] });
+
+  const userAgent =
+    process.env.WIKIDATA_USER_AGENT ||
+    'CoolGuysApp/1.0 (+https://example.com; contact: dev@example.com)';
+
+  // SPARQL: 日本（Q17）内の行政区画ラベルに kw を含むもの
   const sparql = `
-    SELECT DISTINCT ?item ?itemLabel WHERE {
-      ?item rdfs:label ?itemLabel .
-      FILTER(LANG(?itemLabel) = "ja") .
-      FILTER(CONTAINS(?itemLabel, "${kw}")) .
-      ?item wdt:P17 wd:Q17 .                # Japan
-      ?item wdt:P31/wdt:P279* ?class .
-      VALUES ?class {
-        wd:Q515      # city
-        wd:Q747074   # ward (special ward)
-        wd:Q3032114  # designated city
-        wd:Q7016327  # core city
-        wd:Q721657   # town
-        wd:Q484170   # village
-        wd:Q13218630 # municipality
-        wd:Q1084     # prefecture
-      }
-    }
-    LIMIT 30
-  `;
+SELECT ?item ?itemLabel WHERE {
+  ?item wdt:P31 ?class .
+  VALUES ?class { wd:Q515 wd:Q532 wd:Q70208 wd:Q15284 wd:Q484170 }  # city/ward/town/village/municipality 等
+  ?item wdt:P17 wd:Q17 .                                          # country = Japan
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "ja,en". }
+  FILTER(CONTAINS(LCASE(?itemLabel), LCASE("${kw}")))
+}
+LIMIT 20
+  `.trim();
+
+  const url = 'https://query.wikidata.org/sparql?format=json&query=' + encodeURIComponent(sparql);
 
   try {
-    const r = await fetch(
-      `https://query.wikidata.org/sparql?query=${encodeURIComponent(sparql)}`,
-      { headers: { Accept: "application/sparql-results+json" } }
-    );
-    if (!r.ok) {
-      return res.status(502).json({ error: "Wikidata query failed", status: r.status });
-    }
-    const data = await r.json();
-    const rows = data?.results?.bindings || [];
-
-    const candidates = rows.map((row) => {
-      const label = row.itemLabel?.value || "";
-      const uri = row.item?.value || "";
-      const qid = uri.split("/").pop(); // e.g., https://www.wikidata.org/entity/Q12345 -> Q12345
-      return {
-        regionName: label,
-        areaCode: qid,
-      };
+    const r = await fetchWithRetry(url, {
+      headers: {
+        'User-Agent': userAgent,
+        'Accept': 'application/sparql-results+json',
+      },
     });
-
+    if (!r.ok) {
+      return res.status(502).json({ candidates: [], warning: `Wikidata error ${r.status}` });
+    }
+    const json = await r.json();
+    const candidates = (json.results?.bindings || []).map((b) => {
+      const qid = (b.item?.value || '').split('/').pop();
+      const regionName = b.itemLabel?.value || qid;
+      return { regionName, qid };
+    });
     return res.status(200).json({ candidates });
   } catch (e) {
-    return res.status(503).json({ error: e?.message || "Wikidata unavailable" });
+    return res.status(502).json({ candidates: [], warning: String(e) });
   }
-}
+};
