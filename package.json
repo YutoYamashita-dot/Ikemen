@@ -1,8 +1,15 @@
 {
-  "dependencies": {
-    "@vercel/node": "3",
-    "@vercel/blob": "0.23.3",
-    "node-fetch": "3.3.2"
+  "name": "coolguys-backend",
+  "version": "1.1.0",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
-  "type": "module"
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  }
 }
